@@ -23,11 +23,11 @@ PREVIEW_WIDTH = 640
 # キャッシュ付きフレーム取得 + 人物検出 (プレビュー用)
 # ----------------------------------------------------------------------
 @st.cache_data(show_spinner=False, max_entries=24)
-def cached_frame_people(path, idx):
+def cached_frame_people(path, idx, kind="full"):
     frame = engine.read_frame(path, idx, PREVIEW_WIDTH)
     if frame is None:
         return None, []
-    return frame, engine.detect_people_image(frame)
+    return frame, engine.detect_people_image(frame, kind)
 
 
 def discard_video():
@@ -88,7 +88,8 @@ st.session_state.setdefault("tol", 0.05)
 # ----------------------------------------------------------------------
 def cb_find_first():
     with st.spinner("最初に人が映るフレームを探しています..."):
-        f = engine.find_first_person_frame(path, 0)
+        _k = "full" if st.session_state.get("model_kind", "高精度 (full)").startswith("高精度") else "lite"
+        f = engine.find_first_person_frame(path, 0, kind=_k)
     if f is None:
         st.session_state["_msg"] = "人物を検出できませんでした。"
     else:
@@ -117,6 +118,10 @@ st.subheader("🎯 2. プレビューで走者・接地ライン・解析範囲�
 if st.session_state.get("_msg"):
     st.info(st.session_state.pop("_msg"))
 
+st.radio("姿勢推定モデル（精度が低いと感じたら『高精度』）", ["高精度 (full)", "軽量 (lite)"],
+         horizontal=True, key="model_kind")
+kind = "full" if st.session_state["model_kind"].startswith("高精度") else "lite"
+
 left, right = st.columns([3, 2])
 
 with right:
@@ -137,7 +142,7 @@ with right:
         pv = st.slider("フレーム位置", 0, last, value=min(max(start_f, 0), last), key="pv_frame")
 
 # 開始フレームの人物検出 → ターゲット選択
-start_frame_img, start_people = cached_frame_people(path, start_f)
+start_frame_img, start_people = cached_frame_people(path, start_f, kind)
 
 with right:
     st.markdown("**③ ターゲット選手（最初に追跡する人）**")
@@ -156,6 +161,17 @@ with right:
             st.success("開始フレームの走者 1人をロックオンします。")
         target_point = engine.person_center(start_people[target_idx_start])
 
+    st.select_slider(
+        "追跡の厳しさ（別の人に乗り移る → 厳しい ／ すぐ追跡が切れる → 緩い）",
+        options=["緩い", "標準", "厳しい"], value="標準", key="strict")
+
+    st.markdown("**⑤ 解析する歩数**")
+    unlimited = st.checkbox("歩数を制限しない（ロックした人がフレームアウトするまで）", value=False, key="unlimited")
+    st.slider("ロックした人の最初のN歩だけ解析する", 1, 12, 3, key="n_steps", disabled=unlimited)
+    max_steps = 0 if unlimited else int(st.session_state["n_steps"])
+    if not unlimited:
+        st.caption(f"最初の{max_steps}歩の接地を取得した時点で解析を終了します（後半の誤検出や乗り移りを防ぎます）。")
+
     st.markdown("**④ 接地ライン**")
     st.slider("地面の高さ（上=0 / 下=1）", 0.30, 0.99, step=0.005, key="ground_y")
     st.slider("接地ゾーンの幅（広いほど接地を拾いやすい）", 0.02, 0.15, step=0.005, key="tol")
@@ -167,10 +183,12 @@ tol = st.session_state["tol"]
 current_params = (
     start_f, end_f,
     tuple(round(float(v), 3) for v in target_point) if target_point is not None else None,
+    st.session_state.get("strict", "標準"),
+    max_steps, kind,
 )
 
 with left:
-    frame, people = cached_frame_people(path, pv)
+    frame, people = cached_frame_people(path, pv, kind)
     if frame is None:
         st.error("このフレームを読み込めませんでした。")
     else:
@@ -214,7 +232,8 @@ if st.button("追跡テストを実行"):
     try:
         _, rep, ex = engine.analyze_sprint(
             path, ground_y, start_f, end_f, target_point, tol, PREVIEW_WIDTH, dry_run=True,
-            progress_callback=lambda f, t: bar.progress(f, text=t))
+            progress_callback=lambda f, t: bar.progress(f, text=t),
+            strictness=st.session_state.get("strict", "標準"), max_steps=max_steps, model=kind)
         st.session_state["dry"] = {"report": rep, "extras": ex, "ground": ground_y, "tol": tol,
                                    "params": current_params}
     except Exception as e:
@@ -246,6 +265,10 @@ if dry:
         st.line_chart(df)
         st.caption("足首の高さが『接地ゾーン上端』を下回った瞬間が接地です。途切れた部分はターゲット未検出です。"
                    + (f" 検出した接地フレーム: {ex['contacts']}" if ex["contacts"] else ""))
+    if ex.get("thumbs"):
+        st.markdown("**🔎 追跡確認：ロックしている人の切り抜き（同じ人が続いているか確認してください）**")
+        st.image([t[1] for t in ex["thumbs"]], caption=[f"F{t[0]}" for t in ex["thumbs"]], width=90)
+        st.caption("別の人が混ざっている場合は「追跡の厳しさ」を『厳しい』に、途中で切れる場合は『緩い』にして再テストしてください。")
 
 # ----------------------------------------------------------------------
 # 本解析
@@ -259,7 +282,8 @@ if st.button("動作解析を開始する", type="primary"):
         try:
             out_path, report, ex = engine.analyze_sprint(
                 path, ground_y, start_f, end_f, target_point, tol, PREVIEW_WIDTH, dry_run=False,
-                progress_callback=lambda f, t: bar.progress(f, text=t))
+                progress_callback=lambda f, t: bar.progress(f, text=t),
+                strictness=st.session_state.get("strict", "標準"), max_steps=max_steps, model=kind)
             video_bytes = None
             if out_path and os.path.exists(out_path):
                 with open(out_path, "rb") as fh:
@@ -283,6 +307,10 @@ if res:
         cols = st.columns(3)
         for i, (_, jpg, cap_text) in enumerate(ex["captures"]):
             cols[i % 3].image(jpg, caption=cap_text, use_container_width=True)
+
+    if ex.get("thumbs"):
+        st.markdown("#### 🔎 追跡確認（解析した人の切り抜き）")
+        st.image([t[1] for t in ex["thumbs"]], caption=[f"F{t[0]}" for t in ex["thumbs"]], width=90)
 
     if res["video"]:
         st.markdown("#### 🎞️ 解析動画")
