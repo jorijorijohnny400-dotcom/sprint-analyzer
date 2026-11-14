@@ -163,24 +163,45 @@ with right:
 
 ground_y = st.session_state["ground_y"]
 tol = st.session_state["tol"]
+# 追跡結果が有効かどうかの判定用（範囲・ターゲットが変わったら無効）
+current_params = (
+    start_f, end_f,
+    tuple(round(float(v), 3) for v in target_point) if target_point is not None else None,
+)
 
 with left:
     frame, people = cached_frame_people(path, pv)
     if frame is None:
         st.error("このフレームを読み込めませんでした。")
     else:
-        t_idx = engine.pick_nearest(people, target_point) if people else None
+        _dry = st.session_state.get("dry")
+        track_ok = bool(_dry) and _dry.get("params") == current_params
+        roles = True
+        note = ""
+        if pv == start_f:
+            # 開始フレーム: 選択した人がターゲット
+            t_idx = engine.pick_nearest(people, target_point) if people else None
+        elif track_ok:
+            # 追跡テスト済み: 実際にロックされていた位置の人だけがターゲット
+            c = _dry["extras"]["track"].get(pv)
+            t_idx = engine.match_center(people, c) if c is not None else None
+            if t_idx is None:
+                note = "このフレームではターゲット未追跡（他の人はすべて無視されます）"
+        else:
+            t_idx = None
+            roles = False
+            note = "追跡テストを実行すると、このフレームでロックされている人が表示されます"
         st.session_state["_ankle_y"] = engine.lowest_ankle_y(people[t_idx]) if t_idx is not None else None
         in_range = start_f <= pv <= end_f
-        img = engine.render_preview(frame, people, t_idx, ground_y, tol, pv, in_range)
+        img = engine.render_preview(frame, people, t_idx, ground_y, tol, pv, in_range, banner="", roles=roles)
         st.image(img, use_container_width=True)
         st.caption(
-            "🟧 オレンジ = ロックオン中のターゲット　⬜ グレー = 解析対象外の人　"
+            "🟧 オレンジ = ロックオン中のターゲット（1人だけ）　⬜ グレー(IGNORE) = 無視される人　"
             "🟢 緑ライン/帯 = 接地判定ゾーン　🔴 赤丸 = 接地ゾーン内の足首　"
             "枠の色：緑=解析範囲内 / 赤=範囲外"
         )
-        if show == "任意のフレーム" and pv != start_f:
-            st.caption("※ 開始フレーム以外では、開始時のターゲット位置に最も近い人を表示しています。")
+        if note:
+            st.info(note)
 
 # ----------------------------------------------------------------------
 # 追跡テスト (動画出力なし)
@@ -194,7 +215,8 @@ if st.button("追跡テストを実行"):
         _, rep, ex = engine.analyze_sprint(
             path, ground_y, start_f, end_f, target_point, tol, PREVIEW_WIDTH, dry_run=True,
             progress_callback=lambda f, t: bar.progress(f, text=t))
-        st.session_state["dry"] = {"report": rep, "extras": ex, "ground": ground_y, "tol": tol}
+        st.session_state["dry"] = {"report": rep, "extras": ex, "ground": ground_y, "tol": tol,
+                                   "params": current_params}
     except Exception as e:
         st.error(f"追跡テストでエラー: {e}")
     finally:
