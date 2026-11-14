@@ -210,6 +210,15 @@ def detect_people_image(frame_bgr):
     return people
 
 
+def match_center(people, center, max_d=0.2):
+    """記録済みのターゲット中心に最も近い人の index（遠ければ None）。"""
+    if not people or center is None:
+        return None
+    d = [math.hypot(person_center(p)[0] - center[0], person_center(p)[1] - center[1]) for p in people]
+    i = int(np.argmin(d))
+    return i if d[i] <= max_d else None
+
+
 def default_target_index(people):
     """プレビューの初期ターゲット = 最も大きく映っている人。"""
     if not people:
@@ -309,7 +318,7 @@ TARGET_COLOR = (0, 140, 255)  # BGR: オレンジ
 OTHER_COLOR = (170, 170, 170)
 
 
-def render_preview(frame_bgr, people, target_idx, ground_y, tol, frame_idx, in_range, banner=""):
+def render_preview(frame_bgr, people, target_idx, ground_y, tol, frame_idx, in_range, banner="", roles=True):
     """プレビュー画像(RGB)を返す。ターゲット/他の人/足首/接地ゾーン/範囲内外を描画。"""
     import cv2
 
@@ -321,7 +330,13 @@ def render_preview(frame_bgr, people, target_idx, ground_y, tol, frame_idx, in_r
         _draw_person(img, p, TARGET_COLOR if is_t else OTHER_COLOR, 3 if is_t else 1)
         head = (int(p[0, 0] * w) if p[0, 3] > 0.3 else int(person_center(p)[0] * w),
                 max(14, int((p[0, 1] if p[0, 3] > 0.3 else person_center(p)[1] - 0.1) * h) - 18))
-        _label(img, f"#{i + 1} TARGET" if is_t else f"#{i + 1}", head, TARGET_COLOR if is_t else (220, 220, 220))
+        if is_t:
+            txt = f"#{i + 1} TARGET"
+        elif roles:
+            txt = f"#{i + 1} IGNORE"
+        else:
+            txt = f"#{i + 1}"
+        _label(img, txt, head, TARGET_COLOR if is_t else (220, 220, 220))
         if is_t:
             _draw_ankles(img, p, ground_y, tol)
     border = (0, 200, 0) if in_range else (0, 0, 255)
@@ -334,53 +349,107 @@ def render_preview(frame_bgr, people, target_idx, ground_y, tol, frame_idx, in_r
 # ターゲット追跡 (最初の走者をロックオン)
 # ----------------------------------------------------------------------
 class TargetTracker:
+    """最初の走者「だけ」をロックオンし、それ以外の人物は一切追わない。
+
+    - ロック前: プレビューで指定した人(target_point)に近い人だけにロックする。
+      指定が無ければ、最初に映った人にロックする。別の人へ自動で切り替えることはしない。
+    - ロック後: 予測位置の近くで、体の大きさも近い人だけを同一人物とみなす。
+      見失う時間が長くなっても照合範囲は広げない。
+    - 終了: フレーム端で消えた、または一定時間見失ったら ended=True。
+      一度終了したら二度と再取得しない（後から映る別の人に乗り移らない）。
+    """
+
     def __init__(self, target_point=None, fps=30.0):
         self.target_point = target_point
         self.fps = fps
         self.locked = False
+        self.ended = False
+        self.end_reason = ""
         self.center = None
+        self.height = None
         self.vel = (0.0, 0.0)
         self.lost = 0
         self.wait = 0
+        self.lost_limit = max(4, int(fps * 0.3))
+        self.edge_lost_limit = max(2, int(fps * 0.1))
+        self.max_wait = max(10, int(fps * 1.0))
 
     def _lock(self, people, i):
         self.locked = True
         self.center = person_center(people[i])
+        h = person_height(people[i])
+        self.height = h if h > 0 else None
+        self.vel = (0.0, 0.0)
         self.lost = 0
         return i
 
+    def _end(self, reason):
+        self.ended = True
+        self.end_reason = reason
+
     def update(self, people):
         """ターゲットの index を返す。見つからなければ None。"""
-        if not self.locked:
-            if not people:
-                return None
-            if self.target_point is not None:
-                i = pick_nearest(people, self.target_point)
-                d = math.hypot(*(np.subtract(person_center(people[i]), self.target_point)))
-                self.wait += 1
-                if d < 0.35 or self.wait >= self.fps * 2:
-                    return self._lock(people, i)
-                return None
-            i = int(np.argmax([person_height(p) for p in people]))
-            return self._lock(people, i)
-
-        if not people:
-            self.lost += 1
+        if self.ended:
             return None
-        k = self.lost + 1
+
+        # ---------- ロック前 ----------
+        if not self.locked:
+            self.wait += 1
+            cands = [i for i, p in enumerate(people) if person_quality(p) >= 0.4]
+            if self.target_point is not None:
+                if cands:
+                    ds = {i: math.hypot(person_center(people[i])[0] - self.target_point[0],
+                                        person_center(people[i])[1] - self.target_point[1])
+                          for i in cands}
+                    i = min(ds, key=ds.get)
+                    if ds[i] < 0.25:
+                        return self._lock(people, i)
+                if self.wait > self.max_wait:
+                    self._end("指定したターゲットを開始位置で検出できなかったため解析を終了しました")
+                return None
+            # 指定なし: 最初に映った人（同時に複数なら大きい人）
+            if cands:
+                big = [i for i in cands if person_height(people[i]) >= 0.12] or cands
+                return self._lock(people, max(big, key=lambda j: person_height(people[j])))
+            return None
+
+        # ---------- ロック後 ----------
+        k = min(self.lost + 1, 4)
         pred = (self.center[0] + self.vel[0] * k, self.center[1] + self.vel[1] * k)
-        gate = min(0.12 + 0.03 * self.lost, 0.35)
-        cs = [person_center(p) for p in people]
-        d = [math.hypot(c[0] - pred[0], c[1] - pred[1]) for c in cs]
-        i = int(np.argmin(d))
-        if d[i] <= gate:
-            new = cs[i]
-            self.vel = (0.5 * self.vel[0] + 0.5 * (new[0] - self.center[0]) / k,
-                        0.5 * self.vel[1] + 0.5 * (new[1] - self.center[1]) / k)
+        gate = min(0.12 + 0.02 * self.lost, 0.22)
+
+        best, best_d = None, 1e9
+        for i, p in enumerate(people):
+            if person_quality(p) < 0.3:
+                continue
+            c = person_center(p)
+            d = math.hypot(c[0] - pred[0], c[1] - pred[1])
+            h = person_height(p)
+            if self.height and h > 0 and not (0.55 <= h / self.height <= 1.8):
+                continue  # 体の大きさが違う = 別人
+            if d < best_d:
+                best, best_d = i, d
+
+        if best is not None and best_d <= gate:
+            new = person_center(people[best])
+            kk = self.lost + 1
+            self.vel = (0.5 * self.vel[0] + 0.5 * (new[0] - self.center[0]) / kk,
+                        0.5 * self.vel[1] + 0.5 * (new[1] - self.center[1]) / kk)
             self.center = new
+            h = person_height(people[best])
+            if h > 0:
+                self.height = h if not self.height else 0.8 * self.height + 0.2 * h
             self.lost = 0
-            return i
+            return best
+
+        # 見失った
         self.lost += 1
+        cx = self.center[0]
+        exiting = (cx > 0.85 and self.vel[0] > 0.003) or (cx < 0.15 and self.vel[0] < -0.003)
+        if exiting and self.lost >= self.edge_lost_limit:
+            self._end("ターゲットがフレームアウトしたため解析を終了しました")
+        elif self.lost > self.lost_limit:
+            self._end("ターゲットを見失ったため（フレームアウトとみなし）解析を終了しました")
         return None
 
 
@@ -430,7 +499,6 @@ def analyze_sprint(input_video_path, ground_y_normalized=0.8, start_frame=0, end
 
     landmarker = _make_landmarker(video_mode=True, num_poses=4)
     tracker = TargetTracker(target_point, fps)
-    lost_limit = max(5, int(fps * 0.5))
 
     writer = None
     out_path = None
@@ -438,6 +506,7 @@ def analyze_sprint(input_video_path, ground_y_normalized=0.8, start_frame=0, end
     size = None
     captures = []
     trajectory = []
+    track = {}
     summary_report = []
     skipped = []
 
@@ -464,8 +533,10 @@ def analyze_sprint(input_video_path, ground_y_normalized=0.8, start_frame=0, end
             people = _detect(landmarker, img, ts)
             ti = tracker.update(people)
 
-            if tracker.locked and ti is None and tracker.lost > lost_limit:
-                end_reason = f"ターゲットがフレームアウトしたため、フレーム {lock_end} で解析を終了しました"
+            if tracker.ended:
+                end_reason = tracker.end_reason
+                if lock_end is not None:
+                    end_reason += f"（最後に検出: フレーム {lock_end}）"
                 break
 
             touchdown_step = None
@@ -475,6 +546,7 @@ def analyze_sprint(input_video_path, ground_y_normalized=0.8, start_frame=0, end
                 if lock_start is None:
                     lock_start = idx
                 lock_end = idx
+                track[idx] = person_center(lms)
                 ankle_y_val = lowest_ankle_y(lms)
 
                 # 足首が低い(=接地側)の脚を採用
@@ -516,9 +588,8 @@ def analyze_sprint(input_video_path, ground_y_normalized=0.8, start_frame=0, end
             if not dry_run:
                 disp = img  # 縮小済みフレームをそのまま加工
                 _draw_ground(disp, ground_y_normalized, ground_tol)
-                for j, p in enumerate(people):
-                    _draw_person(disp, p, TARGET_COLOR if j == ti else OTHER_COLOR, 2 if j == ti else 1)
-                if ti is not None:
+                if ti is not None:  # ターゲット以外は描画もしない
+                    _draw_person(disp, people[ti], TARGET_COLOR, 2)
                     _draw_ankles(disp, people[ti], ground_y_normalized, ground_tol)
                     _label(disp, "TARGET", (10, 22), TARGET_COLOR)
                 if writer is None:
@@ -570,8 +641,11 @@ def analyze_sprint(input_video_path, ground_y_normalized=0.8, start_frame=0, end
     report_text += "> * **膝角度（接地時）:** `152〜155度` が理想\n"
     report_text += "> * **体幹角度（接地時）:** `170〜176度` が理想\n\n"
     if lock_start is not None:
-        report_text += (f"> 🎯 **解析対象:** 最初にロックオンした走者（フレーム {lock_start}〜{lock_end}）\n"
-                        f"> * {end_reason}\n\n")
+        report_text += (f"> 🎯 **解析対象:** 最初にロックオンした走者 1名のみ（フレーム {lock_start}〜{lock_end}）\n"
+                        f"> * {end_reason}\n"
+                        f"> * それ以外の人物は追跡・解析の対象外です\n\n")
+    else:
+        report_text += f"> ⚠️ ターゲットをロックオンできませんでした。{end_reason}\n\n"
     report_text += "---\n\n"
 
     if len(summary_report) == 0:
@@ -596,6 +670,7 @@ def analyze_sprint(input_video_path, ground_y_normalized=0.8, start_frame=0, end
     extras = {
         "captures": captures,
         "trajectory": trajectory,
+        "track": track,
         "lock_start": lock_start,
         "lock_end": lock_end,
         "end_reason": end_reason,
