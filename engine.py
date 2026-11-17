@@ -462,9 +462,13 @@ def render_preview(frame_bgr, people, target_idx, ground_y, tol, frame_idx, in_r
         _label(img, txt, head, TARGET_COLOR if is_t else (220, 220, 220))
         if is_t:
             _draw_ankles(img, p, ground_y, tol)
-    border = (0, 200, 0) if in_range else (0, 0, 255)
+    border = (0, 200, 0) if (in_range or in_range is None) else (0, 0, 255)
     cv2.rectangle(img, (0, 0), (w - 1, h - 1), border, 6)
-    _label(img, f"Frame {frame_idx}  {'IN RANGE' if in_range else 'OUT OF RANGE'}  {banner}", (10, 24), border)
+    if in_range is None:  # 開始フレームだけを見せるプレビュー
+        state_txt = "START FRAME"
+    else:
+        state_txt = "IN RANGE" if in_range else "OUT OF RANGE"
+    _label(img, f"Frame {frame_idx}  {state_txt}  {banner}".rstrip(), (10, 24), border)
     return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
 
